@@ -1,17 +1,21 @@
 package cl;
 
 import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.Visibility;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.dynamic.DynamicType;
-import net.bytebuddy.dynamic.MethodTransformer;
+import net.bytebuddy.dynamic.Transformer;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.dynamic.scaffold.TypeValidation;
 import net.bytebuddy.implementation.MethodDelegation;
+import net.bytebuddy.implementation.SuperMethodCall;
+import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 import net.bytebuddy.pool.TypePool;
+import org.apache.commons.io.IOUtils;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -36,51 +40,156 @@ import java.util.jar.JarInputStream;
  */
 public class InnerClassLoader extends ClassLoader {
 
+    private static Map<ClassFileLocator, TypePool> typePools = new HashMap<>();
+    TypePool typePool = TypePool.Default.of(this);
     private Map<String, Class<?>> loadedClasses = new HashMap<>();
+    private Map<String, byte[]> byteCache = new HashMap<>();
 
     public InnerClassLoader(URL url) throws Exception {
         File directory = new File(url.toURI());
         addDirectory(url, directory);
     }
 
-    TypePool typePool = TypePool.Default.of(this);
+    private static boolean hasPackagePrivateMethod(MethodDescription methodDescription) {
+        return methodDescription.isPackagePrivate();
+    }
+
+    private static boolean hasPackagePrivateOrProtectedField(FieldDescription fieldDescription) {
+        return fieldDescription.isPackagePrivate() || fieldDescription.isProtected();
+    }
+
+    private static boolean isPackagePrivateClass(TypeDescription typeDescription) {
+        return (typeDescription.isPackagePrivate() && !typeDescription.isAnnotation());
+    }
+
+    private static ElementMatcher<FieldDescription> fieldMatchers() {
+        return ElementMatchers.isPackagePrivate().or(ElementMatchers.isProtected())
+            .and(ElementMatchers.not(ElementMatchers.isAnnotatedWith(ElementMatchers.named("javax.inject.Inject"))));
+    }
+
+    private static boolean shouldProxyMethod(MethodDescription.InDefinedShape inDefinedShape) {
+        return inDefinedShape.isPackagePrivate();
+    }
+
+    private static boolean shouldProxyClass(TypeDescription typeDescription) {
+        return (typeDescription.isPackagePrivate() && !typeDescription.isAnnotation());
+    }
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
         if (loadedClasses.containsKey(name)) {
             return loadedClasses.get(name);
         }
-        if (!byteCache.containsKey(name) || name.startsWith("java.") || name.startsWith("net.bytebuddy") || name.startsWith("cl.")) {
+        if (!byteCache.containsKey(name) || name.startsWith("java.") || name.startsWith("net.bytebuddy") ||
+            name.startsWith("cl.")) {
             if (name.equals("com.google.gson.Gson")) {
-                throw new ClassNotFoundException("Fake exception since I couldn't find bytecode for GSON. Please run mvn clean install to copy .class files");
+                throw new ClassNotFoundException(
+                    "Fake exception since I couldn't find bytecode for GSON. Please run mvn clean install to copy .class files");
             }
             return super.loadClass(name, resolve);
         } else {
-            TypeDescription typeDescription = typePool.describe(name).resolve();
-            boolean shouldProxyClass = shouldProxyClass(typeDescription);
 
-            Class<?> loaded;
-            if (shouldProxyClass) {
-                DynamicType.Unloaded unloaded = new ByteBuddy().with(TypeValidation.DISABLED).rebase(typeDescription,
-                    ClassFileLocator.Simple.of(name, byteCache.get(name),
-                        ClassFileLocator.ForClassLoader.of(this))).method(
-                    ElementMatchers.not(ElementMatchers.isPrivate()).and(
-                        ElementMatchers.not(ElementMatchers.isAbstract()))).intercept(
-                    MethodDelegation.to(PackagePrivateInterceptor.class)).transform(
-                    MethodTransformer.Simple.withModifiers(Visibility.PUBLIC)).make();
-
-                String packageName = unloaded.getTypeDescription().getPackage().getName();
-                if (getPackage(packageName) == null) {
-                    definePackage(packageName, null, null, null, null, null, null, null);
-                }
-
-                loaded = unloaded.load(this,
-                    ClassLoadingStrategy.Default.INJECTION.withProtectionDomain(
-                        this.getClass().getProtectionDomain())).getLoaded();
-            } else {
-                loaded = defineClass(name, byteCache.get(name), 0, byteCache.get(name).length, this.getClass().getProtectionDomain());
+            //noinspection SuspiciousMethodCalls
+            ClassFileLocator classFileLocator = ClassFileLocator.ForClassLoader.of(this);
+            if (!typePools.containsKey(classFileLocator)) {
+                typePools.put(classFileLocator, TypePool.Default.of(classFileLocator));
             }
 
+            //noinspection SuspiciousMethodCalls
+            TypeDescription typeDescription = typePools.get(classFileLocator).describe(name).resolve();
+            if (typeDescription.isAbstract()) {
+                Class<?> loaded = null;
+                try {
+                    InputStream inputStream = getResource(name.replace('.', '/') + ".class").openStream();
+                    byte[] classBytes = IOUtils.toByteArray(inputStream);
+                    loaded = defineClass(name, classBytes, 0, classBytes.length, getClass().getProtectionDomain());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                if (loaded == null) {
+                    loaded = super.loadClass(name, resolve);
+                }
+                loadedClasses.put(name, loaded);
+                if (resolve) {
+                    resolveClass(loaded);
+                }
+                return loaded;
+            }
+
+
+            boolean shouldProxyClass = isPackagePrivateClass(typeDescription);
+            boolean shouldProxyMethod = false;
+            boolean shouldProxyField = false;
+            for (MethodDescription methodDescription : typeDescription.getDeclaredMethods()) {
+                shouldProxyMethod = hasPackagePrivateMethod(methodDescription);
+                if (shouldProxyMethod) {
+                    break;
+                }
+            }
+            if (!shouldProxyMethod) {
+                for (FieldDescription fieldDescription : typeDescription.getDeclaredFields()) {
+                    shouldProxyField = hasPackagePrivateOrProtectedField(fieldDescription);
+                    if (shouldProxyField) {
+                        break;
+                    }
+                }
+            }
+
+            if (!shouldProxyMethod && !shouldProxyClass && !shouldProxyField) {
+                Class<?> loaded = null;
+                try {
+                    InputStream inputStream = getResource(name.replace('.', '/') + ".class").openStream();
+                    byte[] classBytes = IOUtils.toByteArray(inputStream);
+                    loaded = defineClass(name, classBytes, 0, classBytes.length, getClass().getProtectionDomain());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                if (loaded == null) {
+                    loaded = super.loadClass(name, resolve);
+                }
+                loadedClasses.put(name, loaded);
+                if (resolve) {
+                    resolveClass(loaded);
+                }
+                return loaded;
+            }
+
+            DynamicType.Builder<?> builder = null;
+            try {
+                builder = new ByteBuddy().with(TypeValidation.DISABLED).rebase(typeDescription, classFileLocator);
+            } catch (IllegalStateException e) {
+                if (e.getMessage().startsWith("Cannot resolve type description for")) {
+                    //Attempt to work around the fact that Java Reflection API cannot handle missing classes; by simply not
+                    // proxying:
+                    return null;
+                }
+                //rethrow:
+                throw e;
+            }
+            DynamicType.Unloaded unloaded;
+            if (shouldProxyClass) {
+                if (!shouldProxyField && !shouldProxyMethod) {
+                    unloaded = builder.modifiers(Visibility.PUBLIC).make();
+                } else {
+                    unloaded = builder.modifiers(Visibility.PUBLIC).method(
+                        ElementMatchers.isPackagePrivate().or(ElementMatchers.isProtected())
+                            .and(ElementMatchers.not(ElementMatchers.isAbstract().or(ElementMatchers.isDefaultMethod()))))
+                        .intercept(MethodDelegation.to(PackagePrivateInterceptor.class).andThen(SuperMethodCall.INSTANCE))
+                        .transform(Transformer.ForMethod.withModifiers(Visibility.PUBLIC)).field(fieldMatchers())
+                        .transform(Transformer.ForField.withModifiers(Visibility.PUBLIC)).make();
+                }
+            } else {
+                //Only package-private methods should be proxied.
+                unloaded = builder.method(ElementMatchers.isPackagePrivate().or(ElementMatchers.isProtected())
+                    .and(ElementMatchers.not(ElementMatchers.isAbstract().or(ElementMatchers.isDefaultMethod()))))
+                    .intercept(MethodDelegation.to(PackagePrivateInterceptor.class).andThen(SuperMethodCall.INSTANCE))
+                    .transform(Transformer.ForMethod.withModifiers(Visibility.PUBLIC)).field(fieldMatchers())
+                    .transform(Transformer.ForField.withModifiers(Visibility.PUBLIC)).make();
+            }
+
+            Class<?> loaded = unloaded
+                .load(this, ClassLoadingStrategy.Default.INJECTION.withProtectionDomain(this.getClass().getProtectionDomain()))
+                .getLoaded();
 
 
             if (resolve) {
@@ -90,14 +199,6 @@ public class InnerClassLoader extends ClassLoader {
             return loaded;
         }
 
-    }
-
-    private static boolean shouldProxyMethod(MethodDescription.InDefinedShape inDefinedShape) {
-        return inDefinedShape.isPackagePrivate();
-    }
-
-    private static boolean shouldProxyClass(TypeDescription typeDescription) {
-        return (typeDescription.isPackagePrivate() && !typeDescription.isAnnotation());
     }
 
     public void addDirectory(URL url, File directory) throws Exception {
@@ -145,8 +246,6 @@ public class InnerClassLoader extends ClassLoader {
         }
     }
 
-    private Map<String, byte[]> byteCache = new HashMap<>();
-
     private void addClassIfClass(InputStream inputStream, String relativePath) throws IOException {
         if (relativePath.endsWith(".class")) {
             int len;
@@ -165,5 +264,21 @@ public class InnerClassLoader extends ClassLoader {
 
     private String resourceToClassName(String slashed) {
         return slashed.substring(0, slashed.lastIndexOf(".class")).replace("/", ".");
+    }
+
+    public static class CacheTypePool extends TypePool.Default {
+
+        public CacheTypePool(CacheProvider cacheProvider, ClassFileLocator classFileLocator, ReaderMode readerMode) {
+            super(cacheProvider, classFileLocator, readerMode);
+        }
+
+        public CacheTypePool(CacheProvider cacheProvider, ClassFileLocator classFileLocator, ReaderMode readerMode,
+            TypePool parentPool) {
+            super(cacheProvider, classFileLocator, readerMode, parentPool);
+        }
+
+        public ClassFileLocator getClassFileLocator() {
+            return classFileLocator;
+        }
     }
 }
