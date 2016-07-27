@@ -188,7 +188,7 @@ public class InnerClassLoader extends ClassLoader {
             }
 
             Class<?> loaded = unloaded
-                .load(this, ClassLoadingStrategy.Default.INJECTION.withProtectionDomain(this.getClass().getProtectionDomain()))
+                .load(this, ClassLoadingStrategy.Default.INJECTION.with(this.getClass().getProtectionDomain()))
                 .getLoaded();
 
 
