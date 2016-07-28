@@ -82,10 +82,6 @@ public class InnerClassLoader extends ClassLoader {
         }
         if (!byteCache.containsKey(name) || name.startsWith("java.") || name.startsWith("net.bytebuddy") ||
             name.startsWith("cl.")) {
-            if (name.equals("com.google.gson.Gson")) {
-                throw new ClassNotFoundException(
-                    "Fake exception since I couldn't find bytecode for GSON. Please run mvn clean install to copy .class files");
-            }
             return super.loadClass(name, resolve);
         } else {
 
