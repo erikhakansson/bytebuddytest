@@ -77,6 +77,7 @@ public class InnerClassLoader extends ClassLoader {
 
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        System.out.println(name);
         if (loadedClasses.containsKey(name)) {
             return loadedClasses.get(name);
         }
